@@ -5,8 +5,6 @@ import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
 
 dotenv.config();
-console.log('🔑 OPENAI KEY EXISTS:', !!process.env.OPENAI_API_KEY);
-console.log('🧠 MODEL:', process.env.OPENAI_MODEL);
 
 const app = express();
 
@@ -80,6 +78,32 @@ app.use(express.json());
 const PRIORITIES = ['Low', 'Medium', 'High'];
 const DEFAULT_CATEGORY = 'Work';
 const CATEGORIES = ['Personal', 'Work', 'Learning', 'Sport/Activity', 'Errands'];
+const AI_REQUEST_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 20000);
+
+const PLAN_RESPONSE_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['planTitle', 'subtasks'],
+  properties: {
+    planTitle: { type: 'string' },
+    subtasks: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['title', 'description', 'dueDateIso', 'priority', 'category'],
+        properties: {
+          title: { type: 'string' },
+          description: { type: 'string' },
+          dueDateIso: { type: 'string' },
+          priority: { type: 'string', enum: PRIORITIES },
+          category: { type: 'string', enum: CATEGORIES },
+        },
+      },
+    },
+  },
+};
 
 /**
  * ========================
@@ -108,6 +132,48 @@ function clampDateToRange(date, startDate, endDate) {
   if (date < startDate) return new Date(startDate);
   if (date > endDate) return new Date(endDate);
   return date;
+}
+
+function extractResponseText(response) {
+  if (typeof response?.output_text === 'string' && response.output_text.trim()) {
+    return response.output_text.trim();
+  }
+
+  const outputItems = Array.isArray(response?.output) ? response.output : [];
+  for (const item of outputItems) {
+    const contentItems = Array.isArray(item?.content) ? item.content : [];
+    for (const content of contentItems) {
+      const text = content?.text;
+      if (typeof text === 'string' && text.trim()) {
+        return text.trim();
+      }
+    }
+  }
+
+  return '';
+}
+
+function parseJsonResponse(text) {
+  const cleaned = text.trim();
+  if (!cleaned) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Handle occasional fenced output even with strict instructions.
+    const fenced = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (!fenced?.[1]) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(fenced[1]);
+    } catch {
+      return null;
+    }
+  }
 }
 
 /**
@@ -216,16 +282,26 @@ function normalizePlanPayload(raw, prompt, startDate, endDate) {
  */
 
 async function buildPlanWithOpenAI({ prompt, startDate, endDate }) {
-  if (!openai) return null;
+  if (!openai) {
+    console.warn('OPENAI_API_KEY is missing; using fallback plan generator.');
+    return null;
+  }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10000);
+  const timeout = setTimeout(() => controller.abort(), AI_REQUEST_TIMEOUT_MS);
 
   try {
     const response = await openai.responses.create({
       model: openaiModel,
       temperature: 0.3,
-      signal: controller.signal,
+      text: {
+        format: {
+          type: 'json_schema',
+          name: 'task_plan',
+          strict: true,
+          schema: PLAN_RESPONSE_SCHEMA,
+        },
+      },
       input: [
         {
           role: 'system',
@@ -233,7 +309,9 @@ async function buildPlanWithOpenAI({ prompt, startDate, endDate }) {
             {
               type: 'input_text',
               text:
-                'Return ONLY valid JSON: {"planTitle":"","subtasks":[{"title":"","description":"","dueDateIso":"","priority":"Low|Medium|High","category":"Personal|Work|Learning|Sport/Activity|Errands"}]}',
+                'Generate a practical task plan from the user prompt. '
+                + 'Return JSON only and ensure every dueDateIso is within the provided startDate and endDate. '
+                + 'Prefer 3 to 50 subtasks with specific, non-generic titles.',
             },
           ],
         },
@@ -251,14 +329,29 @@ async function buildPlanWithOpenAI({ prompt, startDate, endDate }) {
           ],
         },
       ],
+    }, {
+      signal: controller.signal,
     });
 
-    const text = response.output_text?.trim();
-    if (!text) return null;
+    const text = extractResponseText(response);
+    const parsed = parseJsonResponse(text);
 
-    return JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object') {
+      console.error('OpenAI returned non-JSON or empty output.', {
+        outputPreview: text.slice(0, 400),
+      });
+      return null;
+    }
+
+    return parsed;
   } catch (err) {
-    console.error('OpenAI error:', err.message);
+    const message = err instanceof Error ? err.message : String(err);
+    const isTimeout = message.toLowerCase().includes('abort');
+    console.error('OpenAI error while building plan:', {
+      timeoutMs: AI_REQUEST_TIMEOUT_MS,
+      reason: isTimeout ? 'timeout' : 'request_failed',
+      message,
+    });
     return null;
   } finally {
     clearTimeout(timeout);
@@ -306,6 +399,10 @@ app.post('/ai/planner', async (req, res) => {
       parsedStart,
       parsedEnd,
     );
+
+    if (!aiPayload) {
+      console.warn('Using fallback plan because AI output was unavailable or invalid.');
+    }
 
     return res.json(payload);
   } catch (err) {
