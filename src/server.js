@@ -5,6 +5,8 @@ import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
 
 dotenv.config();
+console.log('🔑 OPENAI KEY EXISTS:', !!process.env.OPENAI_API_KEY);
+console.log('🧠 MODEL:', process.env.OPENAI_MODEL);
 
 const app = express();
 
